@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,27 @@ import (
 	"github.com/MahyarNemati/mini-container/internal/container"
 	"github.com/MahyarNemati/mini-container/internal/spec"
 )
+
+// TestMain takes the re-exec path before the testing package parses flags.
+//
+// The runtime enters new namespaces by re-executing /proc/self/exe with a
+// sentinel argument. Under `go test` that binary is *this* test binary, so it
+// has to dispatch on the sentinel exactly as cmd/minic does. Without this,
+// the child is a test binary invoked with an unknown flag: it prints the
+// testing package's usage onto the container's stdout and exits 2.
+//
+// That failure is quiet, which is the dangerous part. A test asserting "the
+// host secret does not appear in the output" passes against a usage message,
+// so a suite written with negative assertions can go green while no container
+// has run at all. Every test below therefore asserts something the workload
+// must have produced, and run() refuses output that looks like this failure.
+func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == container.InitArg {
+		container.Init()
+		return // unreachable: Init execs or exits
+	}
+	os.Exit(m.Run())
+}
 
 // minimalRootFS builds a root filesystem containing busybox, which provides
 // sh, ls, hostname and friends as a single static binary.
@@ -103,7 +125,28 @@ func run(t *testing.T, mutate func(*spec.Spec), args ...string) (*container.Resu
 	if err != nil {
 		t.Fatalf("Run: %v\noutput:\n%s", err, out.String())
 	}
-	return result, out.String()
+
+	text := out.String()
+	// The tripwire described on TestMain. If the re-exec dispatch is ever
+	// lost again, this says so instead of letting the suite go green.
+	for _, sign := range []string{container.InitArg, "flag provided but not defined", "Usage of "} {
+		if strings.Contains(text, sign) {
+			t.Fatalf("the container did not run the workload: the re-exec child fell through to "+
+				"the test binary's flag parsing (saw %q). Is TestMain still dispatching on "+
+				"container.InitArg?\noutput:\n%s", sign, text)
+		}
+	}
+	return result, text
+}
+
+// requireRan asserts that a marker the workload itself printed is present. A
+// test that only checks for the absence of something cannot tell a contained
+// container from one that never started.
+func requireRan(t *testing.T, out, marker string) {
+	t.Helper()
+	if !strings.Contains(out, marker) {
+		t.Fatalf("the workload did not run: expected %q in the output\noutput:\n%s", marker, out)
+	}
 }
 
 // writerFile adapts a buffer to the *os.File the config wants, via a pipe.
@@ -177,13 +220,21 @@ func TestProcShowsOnlyContainerProcesses(t *testing.T) {
 	requireRoot(t)
 	// /proc must be mounted *inside* the pid namespace, or it lists the
 	// host's processes -- both a leak and deeply confusing.
-	_, out := run(t, nil, "/bin/sh", "-c", "ls /proc | grep -c '^[0-9]*$'")
-	// A container running one shell should see a handful of pids, not
-	// hundreds.
-	if strings.TrimSpace(out) == "" {
-		t.Fatalf("no output: %q", out)
+	_, out := run(t, nil, "/bin/sh", "-c", "echo ran; ls /proc | grep -c '^[0-9]*$'")
+	requireRan(t, out, "ran")
+
+	// A container running one shell sees a handful of pids, not hundreds. The
+	// count is the assertion: "not empty" would be satisfied by any output at
+	// all, including an error message.
+	fields := strings.Fields(out)
+	n, err := strconv.Atoi(fields[len(fields)-1])
+	if err != nil {
+		t.Fatalf("expected a pid count, got %q", out)
 	}
-	t.Logf("/proc entries: %s", strings.TrimSpace(out))
+	t.Logf("/proc entries: %d", n)
+	if n < 1 || n > 20 {
+		t.Errorf("expected a handful of pids in the namespace, got %d: /proc is probably the host's", n)
+	}
 }
 
 func TestUTSNamespaceSetsTheHostname(t *testing.T) {
@@ -224,7 +275,8 @@ func TestMemoryLimitCausesAnOOMKill(t *testing.T) {
 	result, out := run(t, func(s *spec.Spec) {
 		s.Resources.MemoryBytes = 16 * 1024 * 1024
 		s.Resources.MemorySwapBytes = 0
-	}, "/bin/sh", "-c", "head -c 200m /dev/zero | cat > /tmp/big")
+	}, "/bin/sh", "-c", "echo ran; head -c 200m /dev/zero | cat > /tmp/big")
+	requireRan(t, out, "ran")
 
 	if result.ExitCode == 0 {
 		t.Errorf("expected a failure under a 16 MiB limit, got 0 (output: %s)", out)
@@ -239,14 +291,18 @@ func TestPidsLimitStopsAForkBomb(t *testing.T) {
 	requireRoot(t)
 	// The cheapest protection there is: without pids.max a process inside
 	// the container can exhaust the host's pid space.
-	result, _ := run(t, func(s *spec.Spec) {
+	result, out := run(t, func(s *spec.Spec) {
 		s.Resources.PidsMax = 8
 		s.Timeout = 10 * time.Second
-	}, "/bin/sh", "-c", ":(){ :|:& };: ; sleep 5")
+	}, "/bin/sh", "-c", "echo ran; :(){ :|:& };: ; sleep 5")
+	requireRan(t, out, "ran")
 
 	// The point is that the host survives and the container is contained;
 	// the exact exit code depends on which fork failed.
 	t.Logf("fork bomb result: exit %d, pids peaked at %d", result.ExitCode, result.Stats.Pids)
+	if result.Stats.Pids < 1 {
+		t.Errorf("the cgroup counted no processes at all, so the limit was never tested")
+	}
 	if result.Stats.Pids > 20 {
 		t.Errorf("pids reached %d despite a limit of 8", result.Stats.Pids)
 	}
@@ -254,10 +310,17 @@ func TestPidsLimitStopsAForkBomb(t *testing.T) {
 
 func TestCPULimitIsThrottled(t *testing.T) {
 	requireRoot(t)
-	result, _ := run(t, func(s *spec.Spec) {
+	result, out := run(t, func(s *spec.Spec) {
 		s.Resources.CPUMillis = 100 // a tenth of a core
 		s.Timeout = 8 * time.Second
-	}, "/bin/sh", "-c", "i=0; while [ $i -lt 100000000 ]; do i=$((i+1)); done")
+	}, "/bin/sh", "-c", "echo ran; i=0; while [ $i -lt 100000000 ]; do i=$((i+1)); done")
+	requireRan(t, out, "ran")
+
+	// Burning no CPU at all means the loop never ran, so there was nothing to
+	// throttle and the test would pass for the wrong reason.
+	if result.Stats.CPUUsage <= 0 {
+		t.Errorf("the cgroup recorded no cpu usage, so the limit was never tested")
+	}
 
 	// Throttling is the difference between "slow" and "actually limited".
 	if result.Stats.Throttled == 0 {
@@ -313,7 +376,8 @@ func TestReadOnlyRootStillAllowsTmp(t *testing.T) {
 func TestMountNamespaceDoesNotLeakToTheHost(t *testing.T) {
 	requireRoot(t)
 	before := mountCount(t)
-	run(t, nil, "/bin/sh", "-c", "mount | wc -l")
+	_, out := run(t, nil, "/bin/sh", "-c", "echo ran; mount | wc -l")
+	requireRan(t, out, "ran")
 	after := mountCount(t)
 
 	// Without MS_PRIVATE propagation the container's mounts appear on the
@@ -371,6 +435,9 @@ func TestEnvironmentIsNotInheritedFromTheHost(t *testing.T) {
 	t.Setenv("HOST_SECRET", "do-not-leak")
 
 	_, out := run(t, nil, "/bin/sh", "-c", "echo \"secret=[$HOST_SECRET]\"")
+	// Checking for the marker first: without it, "do-not-leak is absent"
+	// would be satisfied by a container that never started.
+	requireRan(t, out, "secret=[")
 	// A container that sees the host's environment leaks whatever is in it.
 	if strings.Contains(out, "do-not-leak") {
 		t.Errorf("the host environment leaked into the container: %s", out)
