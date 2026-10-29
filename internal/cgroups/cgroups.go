@@ -150,7 +150,14 @@ type Stats struct {
 	// was actually reached, which is the difference between "slow" and
 	// "limited".
 	Throttled int64
-	Pids      int64
+	// Pids is pids.current. Read after the workload exits it is 0, which is
+	// why it is not the thing to assert a pids limit against.
+	Pids int64
+	// PidsPeak is pids.peak, the high-water mark the kernel kept while the
+	// cgroup was alive (Linux 5.19 and later). This is the only counter that
+	// still says anything once the processes are gone, so it is what a test
+	// of pids.max has to look at. Zero means the kernel did not provide it.
+	PidsPeak int64
 }
 
 // Stats reads the current counters. Missing files are not an error: which
@@ -160,6 +167,7 @@ func (g *Group) Stats() Stats {
 	s.MemoryCurrent = g.readInt("memory.current")
 	s.MemoryPeak = g.readInt("memory.peak")
 	s.Pids = g.readInt("pids.current")
+	s.PidsPeak = g.readInt("pids.peak")
 
 	for k, v := range g.readKeyed("memory.events") {
 		if k == "oom_kill" {

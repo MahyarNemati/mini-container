@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/MahyarNemati/mini-container/internal/spec"
@@ -70,18 +71,28 @@ func setupNamespace(s *spec.Spec) error {
 		return fmt.Errorf("make mounts private: %w", err)
 	}
 
+	// Bind mounts go up *before* pivot_root, with the destination resolved
+	// inside the new root. The source is a host path, and pivot_root detaches
+	// the old root -- so after pivoting that path no longer resolves in this
+	// mount namespace and the mount fails with ENOENT. Doing it in the wrong
+	// order is a mistake that looks like a missing directory.
+	//
+	// The rootfs self-bind inside pivotRoot is MS_REC, so mounts placed here
+	// are carried across the pivot.
+	for _, m := range s.Mounts {
+		if err := mountExtra(s.RootFS, m); err != nil {
+			return err
+		}
+	}
+
 	if err := pivotRoot(s.RootFS); err != nil {
 		return err
 	}
 
+	// The pseudo-filesystems go up after the pivot: /proc in particular must
+	// be mounted inside the pid namespace to show the container's processes.
 	if err := mountDefaults(s); err != nil {
 		return err
-	}
-
-	for _, m := range s.Mounts {
-		if err := mountExtra(m); err != nil {
-			return err
-		}
 	}
 
 	if s.ReadOnlyRoot {
@@ -220,10 +231,30 @@ func mountDefaults(s *spec.Spec) error {
 	return nil
 }
 
-func mountExtra(m spec.Mount) error {
-	target := m.Destination
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		return fmt.Errorf("create mount target %s: %w", target, err)
+// mountExtra sets up one configured mount. `root` is the rootfs path on the
+// host: this runs before pivot_root, so the destination has to be resolved
+// relative to it rather than taken as an absolute path in the container.
+func mountExtra(root string, m spec.Mount) error {
+	target, err := resolveInRoot(root, m.Destination)
+	if err != nil {
+		return err
+	}
+
+	// Create the mountpoint. Every container runtime does this -- requiring
+	// the image to contain an empty directory for each volume would make
+	// bind-mounting into a minimal rootfs impossible. A file source needs a
+	// file to mount onto, not a directory.
+	if info, err := os.Stat(m.Source); err == nil && !info.IsDir() {
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return fmt.Errorf("create mount target directory for %s: %w", m.Destination, err)
+		}
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("create mount target %s: %w", m.Destination, err)
+		}
+		_ = f.Close()
+	} else if err := os.MkdirAll(target, 0o755); err != nil {
+		return fmt.Errorf("create mount target %s: %w", m.Destination, err)
 	}
 
 	fstype := m.Type
@@ -246,17 +277,38 @@ func mountExtra(m spec.Mount) error {
 	}
 
 	if err := syscall.Mount(m.Source, target, fstype, flags, ""); err != nil {
-		return fmt.Errorf("mount %s on %s: %w", m.Source, target, err)
+		return fmt.Errorf("mount %s on %s: %w", m.Source, m.Destination, err)
 	}
 	// A read-only bind mount needs a second remount: the MS_RDONLY flag is
 	// ignored on the initial MS_BIND, which is a long-standing kernel
 	// behaviour and a frequent source of "why is my ro mount writable".
 	if flags&syscall.MS_RDONLY != 0 && flags&syscall.MS_BIND != 0 {
 		if err := syscall.Mount("", target, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY, ""); err != nil {
-			return fmt.Errorf("remount %s read-only: %w", target, err)
+			return fmt.Errorf("remount %s read-only: %w", m.Destination, err)
 		}
 	}
 	return nil
+}
+
+// resolveInRoot joins a container-absolute destination onto the rootfs and
+// refuses anything that escapes it. A destination of "../../etc" would
+// otherwise let a spec write outside the container before it even starts.
+//
+// Rejecting rather than silently clamping: quietly rewriting a path that was
+// trying to escape leaves nothing in the logs to notice.
+func resolveInRoot(root, destination string) (string, error) {
+	if !filepath.IsAbs(destination) {
+		return "", fmt.Errorf("mount destination %q must be absolute", destination)
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve rootfs %s: %w", root, err)
+	}
+	target := filepath.Join(absRoot, filepath.Clean(destination))
+	if target != absRoot && !strings.HasPrefix(target, absRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("mount destination %q escapes the root filesystem", destination)
+	}
+	return target, nil
 }
 
 func marshalSpec(s *spec.Spec) (string, error) {

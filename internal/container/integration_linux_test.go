@@ -275,7 +275,12 @@ func TestMemoryLimitCausesAnOOMKill(t *testing.T) {
 	result, out := run(t, func(s *spec.Spec) {
 		s.Resources.MemoryBytes = 16 * 1024 * 1024
 		s.Resources.MemorySwapBytes = 0
-	}, "/bin/sh", "-c", "echo ran; head -c 200m /dev/zero | cat > /tmp/big")
+		// /tmp is a 64 MiB tmpfs, and tmpfs pages are charged to the
+		// cgroup's memory, so filling it is the portable way to push a
+		// container over memory.max. busybox's `head -c 200m` silently
+		// accepts the suffix and writes nothing, which made this test pass
+		// with a peak of 1.8 MB -- dd's count is unambiguous.
+	}, "/bin/sh", "-c", "echo ran; dd if=/dev/zero of=/tmp/big bs=1M count=64 2>/dev/null")
 	requireRan(t, out, "ran")
 
 	if result.ExitCode == 0 {
@@ -294,17 +299,25 @@ func TestPidsLimitStopsAForkBomb(t *testing.T) {
 	result, out := run(t, func(s *spec.Spec) {
 		s.Resources.PidsMax = 8
 		s.Timeout = 10 * time.Second
-	}, "/bin/sh", "-c", "echo ran; :(){ :|:& };: ; sleep 5")
+		// A POSIX loop rather than the `:(){ :|:& };:` one-liner: busybox ash
+		// rejects `:` as a function name ("syntax error: bad function name")
+		// and the whole command never ran.
+	}, "/bin/sh", "-c", "echo ran; i=0; while [ $i -lt 64 ]; do sleep 5 & i=$((i+1)); done; wait")
 	requireRan(t, out, "ran")
 
 	// The point is that the host survives and the container is contained;
 	// the exact exit code depends on which fork failed.
-	t.Logf("fork bomb result: exit %d, pids peaked at %d", result.ExitCode, result.Stats.Pids)
-	if result.Stats.Pids < 1 {
-		t.Errorf("the cgroup counted no processes at all, so the limit was never tested")
+	//
+	// pids.peak, not pids.current: the stats are read after the workload has
+	// exited, so pids.current is 0 and an assertion against it says nothing
+	// either way.
+	t.Logf("fork bomb result: exit %d, pids peaked at %d (current %d)",
+		result.ExitCode, result.Stats.PidsPeak, result.Stats.Pids)
+	if result.Stats.PidsPeak == 0 {
+		t.Skip("this kernel does not provide pids.peak, so the limit cannot be checked after the fact")
 	}
-	if result.Stats.Pids > 20 {
-		t.Errorf("pids reached %d despite a limit of 8", result.Stats.Pids)
+	if result.Stats.PidsPeak > 8 {
+		t.Errorf("pids peaked at %d despite a limit of 8", result.Stats.PidsPeak)
 	}
 }
 
