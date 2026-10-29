@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    name: portable tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./...
+      # Running on macOS too is the point of splitting the platform-specific
+      # syscalls behind build tags: the spec validation, cgroup file logic,
+      # overlay option formatting and image extraction are all testable
+      # anywhere, and that is where most of the bugs live.
+      - name: Test
+        env:
+          CGO_ENABLED: 0
+        run: go test -count=1 ./...
+
+  cross:
+    name: both build paths compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      # The stub files are easy to let rot, since nothing on Linux compiles
+      # them. This is what catches that.
+      - name: Build for Linux and for a non-Linux target
+        env:
+          CGO_ENABLED: 0
+        run: |
+          GOOS=linux  go build ./...
+          GOOS=darwin go build ./...
+          GOOS=windows go build ./...
+          GOOS=linux go vet -tags integration ./...
+
+  containers:
+    name: real containers (linux, root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Report what the runner supports
+        run: |
+          go build -o minic ./cmd/minic
+          sudo ./minic info
+
+      - name: Install busybox for a minimal root filesystem
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq busybox-static
+
+      # This is the only place the interesting behaviour of this project can
+      # be tested: namespaces, pivot_root and cgroups have no equivalent
+      # elsewhere, and mocking them would test nothing.
+      - name: Integration tests
+        env:
+          CGO_ENABLED: 0
+        run: sudo -E env "PATH=$PATH" go test -tags integration -count=1 -v -timeout 10m ./internal/container/...
+
+      - name: End to end through the CLI
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /tmp/rootfs/bin
+          sudo cp "$(which busybox)" /tmp/rootfs/bin/busybox
+          for applet in sh ls hostname echo cat id; do
+            sudo ln -sf busybox /tmp/rootfs/bin/$applet
+          done
+
+          echo "--- pid namespace ---"
+          out=$(sudo ./minic run --rootfs /tmp/rootfs --quiet -- /bin/sh -c 'echo pid=$$')
+          echo "$out"
+          echo "$out" | grep -q 'pid=1' || { echo "::error::workload is not pid 1"; exit 1; }
+
+          echo "--- uts namespace ---"
+          out=$(sudo ./minic run --rootfs /tmp/rootfs --hostname box42 --quiet -- /bin/hostname)
+          echo "$out"
+          echo "$out" | grep -q 'box42' || { echo "::error::hostname not set"; exit 1; }
+
+          echo "--- exit code propagation ---"
+          set +e
+          sudo ./minic run --rootfs /tmp/rootfs --quiet -- /bin/sh -c 'exit 7'
+          code=$?
+          set -e
+          [ "$code" = "7" ] || { echo "::error::exit code was $code, want 7"; exit 1; }
+
+          echo "--- read-only root ---"
+          out=$(sudo ./minic run --rootfs /tmp/rootfs --read-only --quiet -- \
+                /bin/sh -c 'touch /nope 2>&1 || echo refused')
+          echo "$out"
+          echo "$out" | grep -qiE 'refused|read-only' || { echo "::error::read-only root was writable"; exit 1; }
+
+          echo "--- host env does not leak ---"
+          out=$(sudo -E HOST_SECRET=do-not-leak ./minic run --rootfs /tmp/rootfs --quiet -- \
+                /bin/sh -c 'echo "[$HOST_SECRET]"')
+          echo "$out"
+          echo "$out" | grep -q 'do-not-leak' && { echo "::error::host environment leaked"; exit 1; }
+
+          echo "ok: every documented isolation property holds"
+
+      - name: Host mounts did not leak
+        run: |
+          # Without MS_PRIVATE propagation the container's mounts appear on
+          # the host, which is the most commonly missed step.
+          count=$(wc -l < /proc/self/mounts)
+          echo "host mounts after the test run: $count"
+          grep -c 'old-root\|minic' /proc/self/mounts && \
+            { echo "::error::container mounts leaked to the host"; exit 1; } || true
+
+  image-pull:
+    name: pulls a real image from Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go build -o minic ./cmd/minic
+
+      # The registry flow has several steps that only break against a real
+      # registry: the auth challenge, and resolving a multi-platform index.
+      - name: Pull alpine and run it
+        run: |
+          set -euo pipefail
+          ./minic pull alpine:3.20 /tmp/alpine
+          test -x /tmp/alpine/bin/busybox || test -x /tmp/alpine/bin/sh \
+            || { echo "::error::image does not look unpacked"; ls -la /tmp/alpine; exit 1; }
+          cat /tmp/alpine/etc/alpine-release
+
+          out=$(sudo ./minic run --rootfs /tmp/alpine --quiet -- /bin/sh -c 'cat /etc/alpine-release')
+          echo "$out"
+          echo "$out" | grep -q '3\.20' || { echo "::error::container did not run the pulled image"; exit 1; }
+
+      - name: The pull is cached on a second call
+        run: |
+          start=$(date +%s)
+          ./minic pull alpine:3.20 /tmp/alpine
+          elapsed=$(( $(date +%s) - start ))
+          echo "second pull took ${elapsed}s"
+          [ "$elapsed" -le 3 ] || { echo "::error::cache did not take effect"; exit 1; }
+
+  tidy:
+    name: go.mod is tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go mod tidy
+      - run: git diff --exit-code go.mod
