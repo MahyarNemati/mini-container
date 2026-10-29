@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,7 +71,15 @@ func minimalRootFS(t *testing.T) string {
 		t.Fatal(err)
 	}
 	// busybox dispatches on argv[0], so symlinks give us the applets.
-	for _, applet := range []string{"sh", "ls", "hostname", "cat", "echo", "sleep", "ps", "mount", "id", "touch"} {
+	// grep, dd and df are here because the tests use them. A busybox built
+	// with the standalone shell runs applets without a symlink, so a missing
+	// one works on Debian and fails on a host whose busybox was built without
+	// it -- the sort of difference that produces a test that passes in CI and
+	// nowhere else.
+	for _, applet := range []string{
+		"sh", "ls", "hostname", "cat", "echo", "sleep", "ps", "mount", "id", "touch",
+		"grep", "dd", "df", "wc", "head", "sync",
+	} {
 		if err := os.Symlink("busybox", filepath.Join(root, "bin", applet)); err != nil {
 			t.Fatal(err)
 		}
@@ -108,25 +117,30 @@ func run(t *testing.T, mutate func(*spec.Spec), args ...string) (*container.Resu
 		mutate(s)
 	}
 
-	var out bytes.Buffer
 	devnull, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer devnull.Close()
 
+	// A pipe per stream, each drained before its buffer is read. Reading a
+	// buffer while the copying goroutine is still running is a race that
+	// shows up as intermittently empty output -- and an assertion of the form
+	// "the output does not contain X" passes every time it loses.
+	stdout, waitOut := outputPipe(t)
+	stderr, waitErr := outputPipe(t)
+
 	result, err := container.Run(container.Config{
 		Spec:     s,
 		StateDir: t.TempDir(),
 		Stdin:    devnull,
-		Stdout:   writerFile(t, &out),
-		Stderr:   writerFile(t, &out),
+		Stdout:   stdout,
+		Stderr:   stderr,
 	})
+	text := waitOut() + waitErr()
 	if err != nil {
-		t.Fatalf("Run: %v\noutput:\n%s", err, out.String())
+		t.Fatalf("Run: %v\noutput:\n%s", err, text)
 	}
-
-	text := out.String()
 	// The tripwire described on TestMain. If the re-exec dispatch is ever
 	// lost again, this says so instead of letting the suite go green.
 	for _, sign := range []string{container.InitArg, "flag provided but not defined", "Usage of "} {
@@ -149,24 +163,40 @@ func requireRan(t *testing.T, out, marker string) {
 	}
 }
 
-// writerFile adapts a buffer to the *os.File the config wants, via a pipe.
-func writerFile(t *testing.T, buf *bytes.Buffer) *os.File {
+// outputPipe gives the config an *os.File to write to, and a function that
+// closes it, waits for every byte to be copied, and returns the text.
+//
+// The wait is the point. The container writes into a pipe and a goroutine
+// copies it into a buffer; reading that buffer before the copy finishes
+// returns whatever happened to have arrived, which is often nothing.
+func outputPipe(t *testing.T) (*os.File, func() string) {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	var buf bytes.Buffer
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		_, _ = buf.ReadFrom(r)
 	}()
-	t.Cleanup(func() {
-		_ = w.Close()
-		<-done
-		_ = r.Close()
-	})
-	return w
+
+	var once sync.Once
+	wait := func() string {
+		once.Do(func() {
+			// Closing the write end is what gives the reader its EOF. The
+			// child holds its own duplicate of this descriptor, so the reader
+			// does not see EOF until the workload has also exited.
+			_ = w.Close()
+			<-done
+			_ = r.Close()
+		})
+		return buf.String()
+	}
+	// A test that fails before calling wait still releases the pipe.
+	t.Cleanup(func() { wait() })
+	return w, wait
 }
 
 func sanitizeID(s string) string {
@@ -280,15 +310,23 @@ func TestMemoryLimitCausesAnOOMKill(t *testing.T) {
 		// container over memory.max. busybox's `head -c 200m` silently
 		// accepts the suffix and writes nothing, which made this test pass
 		// with a peak of 1.8 MB -- dd's count is unambiguous.
-	}, "/bin/sh", "-c", "echo ran; dd if=/dev/zero of=/tmp/big bs=1M count=64 2>/dev/null")
+		// 32 MiB: twice the memory limit, but half the tmpfs, so the kill
+		// comes from memory.max rather than from ENOSPC. stderr is kept --
+		// suppressing it hid a missing applet and an ENOSPC in turn, and both
+		// times the test passed on the strength of a non-zero exit alone.
+	}, "/bin/sh", "-c", "echo ran; dd if=/dev/zero of=/tmp/big bs=1M count=32")
 	requireRan(t, out, "ran")
 
 	if result.ExitCode == 0 {
 		t.Errorf("expected a failure under a 16 MiB limit, got 0 (output: %s)", out)
 	}
-	if !result.OOMKilled {
-		t.Logf("note: exit %d without an oom_kill counter; memory.events reported %+v",
-			result.ExitCode, result.Stats)
+	// A non-zero exit on its own proves nothing: dd fails for many reasons,
+	// and every earlier version of this test was satisfied by one of them.
+	// The oom_kill counter is the only evidence that the limit did it.
+	if result.Stats.OOMKills == 0 && !result.OOMKilled {
+		t.Errorf("the container failed (exit %d) but the cgroup recorded no OOM kill, "+
+			"so the memory limit is not what stopped it.\nmemory.events: %+v\noutput:\n%s",
+			result.ExitCode, result.Stats, out)
 	}
 }
 

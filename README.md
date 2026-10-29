@@ -233,9 +233,23 @@ This is a teaching implementation and the gaps are the interesting part:
   Without those, a root process inside the container is much closer to root
   outside than the namespaces alone suggest. **Do not run untrusted code in
   this.**
+- **A bind mount into `/tmp`, `/proc`, `/dev` or `/sys` is shadowed.** Those
+  are mounted after `pivot_root` — `/proc` has to be, to show the container's
+  own processes — while bind mounts go up before it, so a default mount placed
+  on top of one wins. The ordering is forced: a bind mount's source is a host
+  path, and `pivot_root` detaches the old root, so after the pivot that path
+  no longer resolves.
 - **`--no-net` gives you loopback and nothing else.** Real connectivity needs
   a veth pair, a bridge, and iptables rules on the host — a substantial project
   of its own.
+- **Bind-mount destinations are checked, not resolved atomically.** A
+  destination is rejected if it contains a `..` element, and the deepest
+  existing part of the path is resolved so a symlink already in the image
+  cannot point the mount out of the rootfs. What remains is the race: between
+  that check and `mount(2)`, a process inside the container could swap a path
+  component for a symlink. Closing it needs `openat2` with `RESOLVE_IN_ROOT`,
+  which is how runc does it, and is the thing this would have to add before
+  being trusted with an untrusted image.
 - **No `/dev` device nodes.** `mknod` needs privileges a user namespace does
   not grant, and bind-mounting them from the host has to happen before the old
   root is detached; the current ordering does not, so `/dev` is a near-empty

@@ -1,8 +1,7 @@
-//go:build linux
-
 package container
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,7 +14,7 @@ func TestResolveInRootRejectsEscapes(t *testing.T) {
 	root := t.TempDir()
 
 	t.Run("inside the root", func(t *testing.T) {
-		for _, dest := range []string{"/data", "/var/lib/thing", "/a/b/../c"} {
+		for _, dest := range []string{"/data", "/var/lib/thing", "/a/b/c", "/data/"} {
 			got, err := resolveInRoot(root, dest)
 			if err != nil {
 				t.Fatalf("resolveInRoot(%q): %v", dest, err)
@@ -35,6 +34,10 @@ func TestResolveInRootRejectsEscapes(t *testing.T) {
 			"/../../etc/passwd",
 			"/data/../../..",
 			"/a/../../b",
+			// Even one that stays inside: a destination with a ".." is not a
+			// path anyone meant to write, and cleaning it away is how the
+			// previous version looked safe without being honest.
+			"/a/b/../c",
 		} {
 			got, err := resolveInRoot(root, dest)
 			if err == nil {
@@ -60,6 +63,27 @@ func TestResolveInRootRejectsEscapes(t *testing.T) {
 		}
 		if got != filepath.Clean(root) {
 			t.Errorf("resolveInRoot(root, \"/\") = %q, want %q", got, root)
+		}
+	})
+
+	t.Run("a symlink out of the root is refused", func(t *testing.T) {
+		// mount(2) follows symlinks, so a destination pointing at one that
+		// leaves the rootfs would mount onto the host.
+		if err := os.Symlink("/etc", filepath.Join(root, "escape")); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := resolveInRoot(root, "/escape"); err == nil {
+			t.Errorf("resolveInRoot(%q) = %q, want an error", "/escape", got)
+		}
+		// One that stays inside is fine.
+		if err := os.MkdirAll(filepath.Join(root, "real"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("real", filepath.Join(root, "inside")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolveInRoot(root, "/inside"); err != nil {
+			t.Errorf("resolveInRoot(%q): %v", "/inside", err)
 		}
 	})
 

@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/MahyarNemati/mini-container/internal/spec"
@@ -288,27 +287,6 @@ func mountExtra(root string, m spec.Mount) error {
 		}
 	}
 	return nil
-}
-
-// resolveInRoot joins a container-absolute destination onto the rootfs and
-// refuses anything that escapes it. A destination of "../../etc" would
-// otherwise let a spec write outside the container before it even starts.
-//
-// Rejecting rather than silently clamping: quietly rewriting a path that was
-// trying to escape leaves nothing in the logs to notice.
-func resolveInRoot(root, destination string) (string, error) {
-	if !filepath.IsAbs(destination) {
-		return "", fmt.Errorf("mount destination %q must be absolute", destination)
-	}
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return "", fmt.Errorf("resolve rootfs %s: %w", root, err)
-	}
-	target := filepath.Join(absRoot, filepath.Clean(destination))
-	if target != absRoot && !strings.HasPrefix(target, absRoot+string(os.PathSeparator)) {
-		return "", fmt.Errorf("mount destination %q escapes the root filesystem", destination)
-	}
-	return target, nil
 }
 
 func marshalSpec(s *spec.Spec) (string, error) {
