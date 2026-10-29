@@ -70,6 +70,13 @@ func setupNamespace(s *spec.Spec) error {
 		return fmt.Errorf("make mounts private: %w", err)
 	}
 
+	// /dev and its device nodes go up before the pivot, for the same reason
+	// the bind mounts below do: the nodes are bind-mounted from the host, and
+	// after pivot_root the host's /dev is no longer reachable.
+	if err := mountDev(s.RootFS); err != nil {
+		return err
+	}
+
 	// Bind mounts go up *before* pivot_root, with the destination resolved
 	// inside the new root. The source is a host path, and pivot_root detaches
 	// the old root -- so after pivoting that path no longer resolves in this
@@ -178,9 +185,9 @@ func mountDefaults(s *spec.Spec) error {
 		// host's processes -- which is both a leak and deeply confusing, since
 		// `ps` would list things the container cannot signal.
 		{"proc", "/proc", "proc", noexec | nosuid | nodev, ""},
-		// nosuid and nodev on /dev and /tmp: a setuid binary or a device node
-		// placed there would otherwise be a direct escape route.
-		{"tmpfs", "/dev", "tmpfs", nosuid, "mode=755,size=64k"},
+		// nosuid and nodev on /tmp: a setuid binary or a device node placed
+		// there would otherwise be a direct escape route. /dev is mounted
+		// before the pivot instead -- see mountDev.
 		{"tmpfs", "/tmp", "tmpfs", noexec | nosuid | nodev, "mode=1777,size=64m"},
 		{"sysfs", "/sys", "sysfs", noexec | nosuid | nodev | syscall.MS_RDONLY, ""},
 	}
@@ -225,6 +232,68 @@ func mountDefaults(s *spec.Spec) error {
 			if err := syscall.Mount("devpts", "/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666,mode=0620"); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not mount /dev/pts: %v\n", err)
 			}
+		}
+	}
+	return nil
+}
+
+// devNodes are the character devices essentially every program expects. They
+// are bind-mounted one at a time from the host rather than created with
+// mknod(2), which needs CAP_MKNOD in the initial user namespace -- precisely
+// what a rootless container does not have.
+var devNodes = []string{"null", "zero", "full", "random", "urandom", "tty"}
+
+// mountDev puts a tmpfs on the container's /dev and binds the standard device
+// nodes into it.
+//
+// This has to run before pivot_root: the sources are host paths, and the
+// pivot detaches the old root. Doing it afterwards is why an earlier version
+// of this runtime had no /dev at all, so `dd if=/dev/zero` failed with "No
+// such file or directory" and the gap was written up as a limitation instead
+// of fixed.
+//
+// nosuid and nodev on the tmpfs itself: with nodev the kernel ignores device
+// nodes on that filesystem, so the bind mounts are the only devices that
+// work and a node the container creates for itself does nothing.
+func mountDev(root string) error {
+	target := filepath.Join(root, "dev")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return fmt.Errorf("create /dev: %w", err)
+	}
+	if err := syscall.Mount("tmpfs", target, "tmpfs",
+		syscall.MS_NOSUID|syscall.MS_NODEV, "mode=755,size=256k"); err != nil {
+		return fmt.Errorf("mount /dev: %w", err)
+	}
+
+	for _, name := range devNodes {
+		source := filepath.Join("/dev", name)
+		if _, err := os.Stat(source); err != nil {
+			// A host without the node is not an error: /dev/tty is absent in
+			// some build environments and nothing here needs it.
+			continue
+		}
+		dest := filepath.Join(target, name)
+		f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY, 0o666)
+		if err != nil {
+			return fmt.Errorf("create /dev/%s: %w", name, err)
+		}
+		_ = f.Close()
+		if err := syscall.Mount(source, dest, "", syscall.MS_BIND, ""); err != nil {
+			return fmt.Errorf("bind /dev/%s: %w", name, err)
+		}
+	}
+
+	// The three standard streams, as the symlinks every shell expects.
+	for link, dest := range map[string]string{
+		"fd":     "/proc/self/fd",
+		"stdin":  "/proc/self/fd/0",
+		"stdout": "/proc/self/fd/1",
+		"stderr": "/proc/self/fd/2",
+	} {
+		// Pointing into /proc, which is mounted after the pivot -- a symlink
+		// is resolved when it is used, so the order does not matter here.
+		if err := os.Symlink(dest, filepath.Join(target, link)); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("link /dev/%s: %w", link, err)
 		}
 	}
 	return nil

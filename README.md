@@ -250,11 +250,13 @@ This is a teaching implementation and the gaps are the interesting part:
   component for a symlink. Closing it needs `openat2` with `RESOLVE_IN_ROOT`,
   which is how runc does it, and is the thing this would have to add before
   being trusted with an untrusted image.
-- **No `/dev` device nodes.** `mknod` needs privileges a user namespace does
-  not grant, and bind-mounting them from the host has to happen before the old
-  root is detached; the current ordering does not, so `/dev` is a near-empty
-  tmpfs. Most programs cope; anything needing `/dev/null` as a real device
-  does not.
+- **`/dev` has six nodes, not a full set.** `null`, `zero`, `full`, `random`,
+  `urandom` and `tty` are bind-mounted from the host, plus the `fd`, `stdin`,
+  `stdout` and `stderr` symlinks into `/proc/self/fd`. They are bind mounts
+  rather than `mknod` because `mknod` needs `CAP_MKNOD` in the initial user
+  namespace, which is exactly what a rootless container does not have. Nothing
+  else is there: no `/dev/pts`, so no pty allocation, and no loop or block
+  devices.
 - **No image config.** The manifest's config blob (entrypoint, env, working
   directory, user) is fetched but not applied, so `--image alpine` still needs
   an explicit command.

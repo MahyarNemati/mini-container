@@ -311,9 +311,11 @@ func TestMemoryLimitCausesAnOOMKill(t *testing.T) {
 		// accepts the suffix and writes nothing, which made this test pass
 		// with a peak of 1.8 MB -- dd's count is unambiguous.
 		// 32 MiB: twice the memory limit, but half the tmpfs, so the kill
-		// comes from memory.max rather than from ENOSPC. stderr is kept --
-		// suppressing it hid a missing applet and an ENOSPC in turn, and both
-		// times the test passed on the strength of a non-zero exit alone.
+		// comes from memory.max rather than from ENOSPC. tmpfs pages are
+		// charged to the cgroup, which is what makes this a memory limit test
+		// and not a disk one. stderr is kept -- suppressing it hid a missing
+		// applet and then a missing /dev/zero, and both times the test passed
+		// on the strength of a non-zero exit alone.
 	}, "/bin/sh", "-c", "echo ran; dd if=/dev/zero of=/tmp/big bs=1M count=32")
 	requireRan(t, out, "ran")
 
@@ -478,6 +480,39 @@ func TestReadOnlyBindMountRefusesWrites(t *testing.T) {
 
 	if !strings.Contains(out, "refused") && !strings.Contains(out, "read-only") {
 		t.Errorf("a write to a read-only bind mount should have failed: %s", out)
+	}
+}
+
+func TestStandardDeviceNodesWork(t *testing.T) {
+	requireRoot(t)
+	// Without these, `dd if=/dev/zero`, `> /dev/null` and anything seeding a
+	// random number generator all fail inside the container -- which is most
+	// shell scripts.
+	_, out := run(t, nil, "/bin/sh", "-c",
+		"echo ran; dd if=/dev/zero of=/tmp/z bs=1k count=1 2>&1; "+
+			"echo discarded > /dev/null && echo null-ok; "+
+			"dd if=/dev/urandom of=/tmp/r bs=1k count=1 2>&1 && echo urandom-ok")
+	requireRan(t, out, "ran")
+	requireRan(t, out, "null-ok")
+	requireRan(t, out, "urandom-ok")
+	if strings.Contains(out, "can't open") || strings.Contains(out, "No such file") {
+		t.Errorf("a device node is missing: %s", out)
+	}
+}
+
+func TestDevIsNodevSoTheContainerCannotMakeItsOwnDevices(t *testing.T) {
+	requireRoot(t)
+	// The tmpfs on /dev is mounted nodev, so even if the container could
+	// create a node for a host disk the kernel would ignore it. Checking the
+	// mount options is the assertion; mknod itself needs a capability the
+	// container may or may not have.
+	_, out := run(t, nil, "/bin/sh", "-c", "echo ran; mount | grep ' /dev '")
+	requireRan(t, out, "ran")
+	if !strings.Contains(out, "nodev") {
+		t.Errorf("/dev should be mounted nodev: %s", out)
+	}
+	if !strings.Contains(out, "nosuid") {
+		t.Errorf("/dev should be mounted nosuid: %s", out)
 	}
 }
 
